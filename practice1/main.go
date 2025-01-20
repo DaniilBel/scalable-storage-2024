@@ -28,7 +28,7 @@ func main() {
 	go func() {
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-		for _ = range sigs {
+		for range sigs {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			l.Shutdown(ctx)
@@ -41,21 +41,4 @@ func main() {
 	if !errors.Is(err, http.ErrServerClosed) {
 		slog.Info("err", "err", err)
 	}
-
-	// Handle shutdown signals
-	//sigChan := make(chan os.Signal, 1)
-	//signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	//sig := <-sigChan
-	//slog.Info("Received signal", "signal", sig)
-
-	// Graceful shutdown
-	//ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	//defer cancel()
-	//if err := server.Shutdown(ctx); err != nil {
-	//	slog.Error("Server shutdown error", "err", err)
-	//}
-
-	//router.Stop()
-	//storage.Stop()
-	//slog.Info("Application stopped gracefully")
 }
