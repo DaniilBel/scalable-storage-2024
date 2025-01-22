@@ -13,12 +13,14 @@ import (
 
 func main() {
 	r := http.ServeMux{}
+	ctx := context.Background()
 
-	storage := NewStorage(&r, "storage", []string{}, true)
+	storage := NewStorage(&r, ctx, "storage", []string{}, true)
 	router := NewRouter(&r, [][]string{{"storage"}})
 
 	go storage.Run()
 	go router.Run()
+	defer storage.Stop()
 
 	l := &http.Server{
 		Addr:    "127.0.0.1:8080",
@@ -32,7 +34,6 @@ func main() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			l.Shutdown(ctx)
-			storage.engine.Stop()
 		}
 	}()
 

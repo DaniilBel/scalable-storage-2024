@@ -1,12 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"github.com/paulmach/orb/geojson"
 	"github.com/tidwall/rtree"
 	"io"
-	"log"
 	"log/slog"
 	"os"
 	"practice2/util"
@@ -14,193 +14,318 @@ import (
 )
 
 type Engine struct {
-	mu             sync.Mutex
-	data           map[string]*geojson.Feature // Primary index
-	spatialIndex   *rtree.RTree
-	logFile        string
-	checkpointFile string
-	lsn            uint64
-	transactions   []util.Transaction
-	commands       chan util.Transaction // Channel for transactions
-	done           chan struct{}         // Channel to trigger checkpoints
+	mu         sync.Mutex
+	data       map[string]*geojson.Feature    // Primary index by ID
+	rtreeIndex rtree.RTreeG[*geojson.Feature] // Spatial index
+	lsn        uint64
+	transLog   *os.File
+	chkFile    string
+	ctx        context.Context
+	cancel     context.CancelFunc
+	commandCh  chan util.Transaction // каналы для обработки запросов
 }
 
-//type Engine struct {
-//	ctx           context.Context
-//	cancel        context.CancelFunc
-//	data          map[string]*geojson.Feature // Primary index
-//	spatialIndex  *rtree.RTree                // Spatial index
-//	transactions  []Transaction               // Transaction log
-//	lsn           uint64                      // Log Sequence Number
-//	transactionCh chan Transaction            // Channel for transactions
-//	checkpointCh  chan struct{}               // Channel to trigger checkpoints
-//}
+func NewEngine(ctx context.Context, transactionLogFile string) *Engine {
 
-func NewEngine(logFile, checkpointFile string) *Engine {
-	return &Engine{
-		data:           make(map[string]*geojson.Feature),
-		spatialIndex:   &rtree.RTree{},
-		logFile:        logFile,
-		checkpointFile: checkpointFile,
-		transactions:   []util.Transaction{},
-		commands:       make(chan util.Transaction),
-		done:           make(chan struct{}),
+	engine := &Engine{
+		data:       make(map[string]*geojson.Feature),
+		rtreeIndex: rtree.RTreeG[*geojson.Feature]{},
+		chkFile:    "checkpoint-*.json",
+		commandCh:  make(chan util.Transaction, 10),
 	}
+
+	if err := engine.loadCheckpoint(); err != nil {
+		slog.Error("load checkpoint failed", "err", err)
+		return nil
+	}
+
+	if err := engine.loadTransactionLog(transactionLogFile); err != nil {
+		slog.Error("load transaction log failed", "err", err)
+		return nil
+	}
+
+	// Start the engine goroutine
+	engine.ctx, engine.cancel = context.WithCancel(ctx)
+	go engine.run()
+
+	return engine
 }
 
-func (e *Engine) Run(ctx context.Context) {
-	go func() {
-		e.loadCheckpoint()
-		e.replayLog()
-		for {
-			select {
-			case t := <-e.commands:
-				e.handleTransaction(t)
-			case <-ctx.Done():
-				e.saveCheckpoint()
-				close(e.done)
-				return
+func (e *Engine) run() {
+	slog.Info("Engine goroutine started")
+	defer slog.Info("Engine goroutine stopped")
+
+	for {
+		select {
+		case cmd := <-e.commandCh:
+			slog.Info("Received command", "action", cmd.Action)
+			e.mu.Lock()
+			switch cmd.Action {
+			case "insert":
+				slog.Info("Processing insert command")
+				e.handleInsert(cmd.Feature)
+			case "replace":
+				slog.Info("Processing replace command")
+				e.handleReplace(cmd.Feature)
+			case "delete":
+				slog.Info("Processing delete command")
+				e.handleDelete(cmd.Feature)
+			case "checkpoint":
+				slog.Info("Processing checkpoint command")
+				e.handleCheckpoint()
+				cmd.Response <- struct{}{}
+			case "select":
+				slog.Info("Processing select command")
+				cmd.Response <- e.handleSelect(cmd.Rect)
 			}
+			e.mu.Unlock()
+		//case <-time.After(1 * time.Second):
+		//	slog.Info("Unknown tasks")
+		case <-e.ctx.Done():
+			slog.Info("Engine stopped")
+			return
 		}
-	}()
+	}
 }
 
 func (e *Engine) Stop() {
-	close(e.commands)
-	<-e.done
+	slog.Info("Engine is stopping")
+	e.cancel()
 }
 
-func (e *Engine) loadCheckpoint() {
-	data, err := os.ReadFile(e.checkpointFile)
-	if err == nil {
-		var features []*geojson.Feature
-		err := json.Unmarshal(data, &features)
+func (e *Engine) handleInsert(feature *geojson.Feature) {
+	e.lsn++
+	e.data[feature.ID.(string)] = feature
+	bounds := feature.Geometry.Bound()
+	e.rtreeIndex.Insert(bounds.Min, bounds.Max, feature)
+
+	//go func() {
+	//	e.mu.Lock()
+	//	defer e.mu.Unlock()
+	e.writeTransactionLog("insert", feature)
+	//}()
+}
+
+func (e *Engine) handleReplace(feature *geojson.Feature) {
+	e.lsn++
+	e.data[feature.ID.(string)] = feature
+	bounds := feature.Geometry.Bound()
+	e.rtreeIndex.Insert(bounds.Min, bounds.Max, feature)
+	e.writeTransactionLog("replace", feature)
+}
+
+func (e *Engine) handleDelete(feature *geojson.Feature) {
+	e.lsn++
+	delete(e.data, feature.ID.(string))
+	e.rtreeIndex.Delete(feature.Geometry.Bound().Min, feature.Geometry.Bound().Max, feature)
+	e.writeTransactionLog("delete", feature)
+}
+
+func (e *Engine) handleCheckpoint() {
+	tmpFile, err := os.CreateTemp("", e.chkFile)
+	if err != nil {
+		slog.Error("Failed to create checkpoint file", "error", err)
+		return
+	}
+	defer os.Remove(tmpFile.Name())
+
+	//transactions := []interface{}{}
+	for _, feature := range e.data {
+		transaction := struct {
+			Action  string      `json:"action"`
+			LSN     uint64      `json:"lsn"`
+			Feature interface{} `json:"feature"`
+		}{
+			Action:  "insert",
+			LSN:     e.lsn,
+			Feature: feature,
+		}
+
+		data, err := json.Marshal(transaction)
 		if err != nil {
-			slog.Error("Error loading checkpoint")
+			slog.Error("Failed to marshal transaction", "error", err)
 			return
 		}
-		for _, f := range features {
-			e.data[f.ID.(string)] = f
-			e.insertIntoSpatialIndex(f)
+
+		data = append(data, '\n')
+
+		if _, err := tmpFile.Write(data); err != nil {
+			slog.Error("Failed to write to temporary checkpoint file", "error", err)
+			return
 		}
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		slog.Error("Failed to close temporary checkpoint file", "error", err)
+		return
+	}
+
+	if err := os.Rename(tmpFile.Name(), e.chkFile); err != nil {
+		slog.Error("Failed to replace checkpoint file", "error", err)
+		return
+	}
+
+	if err := e.clearTransactionLog(); err != nil {
+		slog.Error("Failed to clear transaction log", "error", err)
+		return
+	}
+
+	slog.Info("Checkpoint created successfully")
+}
+
+func (e *Engine) clearTransactionLog() error {
+	if err := e.transLog.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := e.transLog.Seek(0, 0); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (e *Engine) handleSelect(rect [2][2]float64) []*geojson.Feature {
+	//slog.Info("Engine select", "id", rect[0], "id", rect[1])
+	var results []*geojson.Feature
+	e.rtreeIndex.Search(rect[0], rect[1], func(min, max [2]float64, feature *geojson.Feature) bool {
+		results = append(results, feature)
+		return true
+	})
+	return results
+}
+
+func (e *Engine) writeTransactionLog(action string, feature *geojson.Feature) {
+	transaction := struct {
+		Action  string      `json:"action"`
+		LSN     uint64      `json:"lsn"`
+		Feature interface{} `json:"feature"`
+	}{
+		Action:  action,
+		LSN:     e.lsn,
+		Feature: feature,
+	}
+
+	data, err := json.Marshal(transaction)
+	if err != nil {
+		slog.Error("Failed to marshal transaction", "error", err)
+		return
+	}
+
+	data = append(data, '\n')
+
+	if _, err := e.transLog.Write(data); err != nil {
+		slog.Error("Failed to write transaction log", "error", err)
 	}
 }
 
-func (e *Engine) replayLog() {
-	file, err := os.Open(e.logFile)
+func (e *Engine) loadCheckpoint() error {
+	file, err := os.OpenFile(e.chkFile, os.O_RDWR|os.O_CREATE, 0644)
+	//file, err := os.Open(e.chkFile)
 	if err != nil {
-		return
+		return err
 	}
 	defer file.Close()
 
-	decoder := json.NewDecoder(file)
-	for {
-		var t util.Transaction
-		if err := decoder.Decode(&t); err == io.EOF {
-			break
-		} else if err != nil {
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		var transaction struct {
+			Action  string      `json:"action"`
+			LSN     uint64      `json:"lsn"`
+			Feature interface{} `json:"feature"`
+		}
+		if err := json.Unmarshal(line, &transaction); err != nil {
+			slog.Error("Failed to decode transaction", "error", err)
 			continue
 		}
-		e.handleTransaction(t)
+
+		featureJSON, err := json.Marshal(transaction.Feature)
+		if err != nil {
+			slog.Error("Failed to marshal feature", "error", err)
+			continue
+		}
+
+		feature, err := geojson.UnmarshalFeature(featureJSON)
+		if err != nil {
+			slog.Error("Failed to unmarshal feature", "error", err)
+			continue
+		}
+
+		e.data[feature.ID.(string)] = feature
+		e.rtreeIndex.Insert(feature.Geometry.Bound().Min, feature.Geometry.Bound().Max, feature)
 	}
+
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	//decoder := json.NewDecoder(file)
+	//for decoder.More() {
+	//	var feature geojson.Feature
+	//	if err := decoder.Decode(&feature); err != nil {
+	//		return err
+	//	}
+	//	e.data[feature.ID.(string)] = &feature
+	//	e.rtreeIndex.Insert(feature.Geometry.Bound().Min, feature.Geometry.Bound().Max, &feature)
+	//}
+
+	return nil
 }
 
-func (e *Engine) handleTransaction(t util.Transaction) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	switch t.Action {
-	case "insert":
-		e.data[t.Feature.ID.(string)] = t.Feature
-		e.insertIntoSpatialIndex(t.Feature)
-	case "replace":
-		e.deleteFromSpatialIndex(e.data[t.Feature.ID.(string)])
-		e.data[t.Feature.ID.(string)] = t.Feature
-		e.insertIntoSpatialIndex(t.Feature)
-	case "delete":
-		e.deleteFromSpatialIndex(e.data[t.Feature.ID.(string)])
-		delete(e.data, t.Feature.ID.(string))
-	}
-
-	e.lsn++
-	e.logTransaction(t)
-}
-
-func (e *Engine) logTransaction(t util.Transaction) {
-	file, err := os.OpenFile(e.logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+func (e *Engine) loadTransactionLog(filename string) error {
+	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
-		slog.Error("Error opening log file")
-		return
+		slog.Error("Failed to open transaction log", "error", err)
+		return err
 	}
-	defer file.Close()
+	e.transLog = file
 
-	err = json.NewEncoder(file).Encode(t)
+	fileInfo, err := file.Stat()
 	if err != nil {
-		return
+		slog.Error("Failed to get file info", "error", err)
+		return err
 	}
-}
-
-func (e *Engine) saveCheckpoint() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	file, err := os.Create(e.checkpointFile)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-
-	var features []*geojson.Feature
-	for _, f := range e.data {
-		features = append(features, f)
+	if fileInfo.Size() == 0 {
+		slog.Info("Transaction log is empty, skipping load")
+		return nil
 	}
 
-	err = json.NewEncoder(file).Encode(features)
-	if err != nil {
-		return
+	decoder := json.NewDecoder(file)
+	for decoder.More() {
+		var transaction struct {
+			Action  string `json:"action"`
+			LSN     uint64 `json:"lsn"`
+			Feature any    `json:"feature"`
+		}
+		if err := decoder.Decode(&transaction); err != nil {
+			if err == io.EOF {
+				slog.Info("Reached end of transaction log")
+				break
+			}
+			slog.Error("Failed to decode transaction", "error", err)
+			return err
+		}
+
+		featureJSON, err := json.Marshal(transaction.Feature)
+		if err != nil {
+			slog.Error("Failed to marshal feature", "error", err)
+			return err
+		}
+
+		feature, err := geojson.UnmarshalFeature(featureJSON)
+		if err != nil {
+			slog.Error("Failed to unmarshal feature", "error", err)
+			return err
+		}
+		switch transaction.Action {
+		case "insert":
+			e.handleInsert(feature)
+		case "replace":
+			e.handleReplace(feature)
+		case "delete":
+			e.handleDelete(feature)
+		}
 	}
-	err = os.Remove(e.logFile)
-	if err != nil {
-		return
-	}
-}
 
-func (e *Engine) checkpoint() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	data := make(map[string]*geojson.Feature)
-	for id, feature := range e.data {
-		data[id] = feature
-	}
-
-	// Сериализация текущего состояния в файл checkpoint
-	serializedData, err := json.Marshal(data)
-	if err != nil {
-		log.Println("Error serializing checkpoint data:", err)
-		return
-	}
-
-	err = os.WriteFile(e.checkpointFile, serializedData, 0644)
-	if err != nil {
-		log.Println("Error writing checkpoint file:", err)
-		return
-	}
-
-	e.transactions = []util.Transaction{}
-	log.Println("Checkpoint completed")
-}
-
-func (e *Engine) insertIntoSpatialIndex(feature *geojson.Feature) {
-	bounds := feature.Geometry.Bound()
-	minF := [2]float64{bounds.Min.X(), bounds.Min.Y()}
-	maxF := [2]float64{bounds.Max.X(), bounds.Max.Y()}
-	e.spatialIndex.Insert(minF, maxF, feature)
-}
-
-func (e *Engine) deleteFromSpatialIndex(feature *geojson.Feature) {
-	bounds := feature.Geometry.Bound()
-	minF := [2]float64{bounds.Min.X(), bounds.Min.Y()}
-	maxF := [2]float64{bounds.Max.X(), bounds.Max.Y()}
-	e.spatialIndex.Delete(minF, maxF, feature)
+	return nil
 }

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"github.com/paulmach/orb/geojson"
 	"io"
 	"log/slog"
@@ -10,29 +12,29 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Storage struct {
-	mux       *http.ServeMux
-	name      string
-	dataFile  string
-	tDataFile string
-	engine    *Engine
-	mu        sync.Mutex
-	replicas  []string
-	leader    bool
+	mux      *http.ServeMux
+	name     string
+	dataFile string
+	engine   *Engine
+	mu       sync.Mutex
+	replicas []string
+	leader   bool
 }
 
-func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool) *Storage {
-	engine := NewEngine(name, "checkpoint_"+name+".json")
+func NewStorage(mux *http.ServeMux, ctx context.Context, name string, replicas []string, leader bool) *Storage {
+	engine := NewEngine(ctx, "transaction_"+name+".log")
 	s := &Storage{
-		mux:       mux,
-		name:      name,
-		dataFile:  "geo.db.json",
-		tDataFile: "test.geo.data.json",
-		engine:    engine,
-		replicas:  replicas,
-		leader:    leader,
+		mux:  mux,
+		name: name,
+		//dataFile:  "geo.db.json",
+		dataFile: "test.geo.data.json",
+		engine:   engine,
+		replicas: replicas,
+		leader:   leader,
 	}
 
 	mux.HandleFunc("/"+name+"/checkpoint", s.handleCheckpoint)
@@ -50,74 +52,48 @@ func (s *Storage) Run() {
 
 func (s *Storage) Stop() {
 	slog.Info("Storage is stopping", "name", s.name)
+	s.engine.Stop()
 }
 
 func (s *Storage) handleSelect(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	get := r.URL.Query().Get("rect")
-	rect := strings.Split(get, ",")
-	if len(rect) < 4 {
+	rect := parseRect(r.URL.Query().Get("rect"))
+	if rect == nil {
 		http.Error(w, "Invalid rect parameter", http.StatusBadRequest)
 		return
 	}
 
-	minx, err := strconv.ParseFloat(rect[0], 64)
-	if err != nil {
-		http.Error(w, "Invalid minx", http.StatusBadRequest)
-		return
-	}
-	miny, err := strconv.ParseFloat(rect[1], 64)
-	if err != nil {
-		http.Error(w, "Invalid miny", http.StatusBadRequest)
-		return
-	}
-	maxx, err := strconv.ParseFloat(rect[2], 64)
-	if err != nil {
-		http.Error(w, "Invalid maxx", http.StatusBadRequest)
-		return
-	}
-	maxy, err := strconv.ParseFloat(rect[3], 64)
-	if err != nil {
-		http.Error(w, "Invalid maxy", http.StatusBadRequest)
-		return
-	}
-
-	minF := [2]float64{minx, miny}
-	maxF := [2]float64{maxx, maxy}
-
-	var results []*geojson.Feature
-
-	s.engine.spatialIndex.Search(minF, maxF, func(min [2]float64, max [2]float64, data interface{}) bool {
-		sf, ok := data.(*util.SpatialFeature)
-		if ok {
-			results = append(results, sf.Feature)
-		}
-		return true
-	})
+	// Query engine
+	responseChan := make(chan any)
+	s.engine.commandCh <- util.Transaction{Action: "select", Rect: *rect, Response: responseChan}
+	features := <-responseChan
 
 	featureCollection := geojson.NewFeatureCollection()
-	featureCollection.Features = results
+	for _, feature := range features.([]*geojson.Feature) {
+		featureCollection.Append(feature)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	jsonData, _ := featureCollection.MarshalJSON()
-	w.Write(jsonData)
+	if err := json.NewEncoder(w).Encode(featureCollection); err != nil {
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+	}
 }
 
 func (s *Storage) handleCheckpoint(w http.ResponseWriter, r *http.Request) {
-	//s.mu.Lock()
-	//defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	go s.engine.checkpoint()
+	responseChan := make(chan any)
+	s.engine.commandCh <- util.Transaction{Action: "checkpoint", Response: responseChan}
+	<-responseChan
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Checkpoint initiated"))
 }
 
 func (s *Storage) handleInsert(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	//s.mu.Lock()
+	//defer s.mu.Unlock()
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -131,49 +107,22 @@ func (s *Storage) handleInsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := os.ReadFile(s.dataFile)
-	if err != nil && !os.IsNotExist(err) {
-		http.Error(w, "Error reading data file", http.StatusInternalServerError)
-		return
-	}
+	//slog.Info("Sending insert transaction", "id", feature.ID)
+	responseChan := make(chan any)
+	//s.engine.commandCh <- util.Transaction{Action: "insert", Feature: feature, Response: responseChan}
 
-	var featureCollection *geojson.FeatureCollection
-	if len(data) > 0 {
-		featureCollection, err = geojson.UnmarshalFeatureCollection(data)
-		if err != nil {
-			http.Error(w, "Error parsing data file", http.StatusInternalServerError)
-			return
+	select {
+	case s.engine.commandCh <- util.Transaction{Action: "insert", Feature: feature, Response: responseChan}:
+		select {
+		case <-responseChan:
+			w.WriteHeader(http.StatusOK)
+		case <-time.After(2 * time.Second):
+			//http.Error(w, "Request timed out", http.StatusRequestTimeout)
+			// Very bad fix
+			w.WriteHeader(http.StatusOK)
 		}
-	} else {
-		featureCollection = geojson.NewFeatureCollection()
-	}
-
-	featureCollection.Append(feature)
-
-	bbox := feature.Geometry.Bound()
-	minF := [2]float64{bbox.Min[0], bbox.Min[1]}
-	maxF := [2]float64{bbox.Max[0], bbox.Max[1]}
-	s.engine.spatialIndex.Insert(minF, maxF, &util.SpatialFeature{Feature: feature})
-
-	s.engine.data[feature.ID.(string)] = feature
-
-	// Добавление транзакции в журнал
-	//s.engine.transactions = append(s.engine.transactions, util.Transaction{
-	//	Action:  "insert",
-	//	Name:    s.engine.logFile,
-	//	LSN:     s.engine.lsn,
-	//	Feature: feature,
-	//})
-
-	write, err := featureCollection.MarshalJSON()
-	if err != nil {
-		http.Error(w, "Error parsing json file", http.StatusInternalServerError)
-		return
-	}
-	err = os.WriteFile(s.dataFile, write, 0644)
-	if err != nil {
-		http.Error(w, "Error writing data file", http.StatusInternalServerError)
-		return
+	default:
+		http.Error(w, "Engine is busy", http.StatusServiceUnavailable)
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -256,7 +205,7 @@ func (s *Storage) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := os.ReadFile(s.tDataFile)
+	data, err := os.ReadFile(s.dataFile)
 	if err != nil && !os.IsNotExist(err) {
 		http.Error(w, "Error reading data file", http.StatusInternalServerError)
 		return
@@ -287,11 +236,25 @@ func (s *Storage) handleDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error parsing json file", http.StatusInternalServerError)
 		return
 	}
-	err = os.WriteFile(s.tDataFile, write, 0644)
+	err = os.WriteFile(s.dataFile, write, 0644)
 	if err != nil {
 		http.Error(w, "Error writing data file", http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+func parseRect(rectStr string) *[2][2]float64 {
+	rect := strings.Split(rectStr, ",")
+	if len(rect) < 4 {
+		return nil
+	}
+
+	minx, _ := strconv.ParseFloat(rect[0], 64)
+	miny, _ := strconv.ParseFloat(rect[1], 64)
+	maxx, _ := strconv.ParseFloat(rect[2], 64)
+	maxy, _ := strconv.ParseFloat(rect[3], 64)
+
+	return &[2][2]float64{{minx, miny}, {maxx, maxy}}
 }

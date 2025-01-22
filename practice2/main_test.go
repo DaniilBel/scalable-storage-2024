@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"github.com/paulmach/orb"
 	"github.com/paulmach/orb/geojson"
@@ -9,20 +10,29 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 )
 
-var test_name = "test"
+var testName = "test"
 
 func setup() (*Router, *Storage, *http.ServeMux) {
 	mux := http.NewServeMux()
-	s := NewStorage(mux, test_name, []string{}, true)
-	r := NewRouter(mux, [][]string{{test_name}})
+	ctx := context.Background()
+	s := NewStorage(mux, ctx, testName, []string{}, true)
+	r := NewRouter(mux, [][]string{{testName}})
 	return r, s, mux
 }
 
+// Test passed
 func TestHandleSelect(t *testing.T) {
 	r, s, mux := setup()
+
+	t.Cleanup(func() {
+		if err := os.Remove("transaction_" + testName + ".log"); err != nil && !os.IsNotExist(err) {
+			t.Errorf("Failed to delete transaction.log: %v", err)
+		}
+	})
 
 	go func() { s.Run() }()
 	go func() { r.Run() }()
@@ -30,50 +40,40 @@ func TestHandleSelect(t *testing.T) {
 	t.Cleanup(r.Stop)
 	t.Cleanup(s.Stop)
 
-	feature := geojson.NewFeature(orb.Point{1.0, 2.0})
-	feature.ID = "1"
+	feature1 := geojson.NewFeature(orb.Point{1.0, 2.0})
+	feature1.ID = "1"
+	feature2 := geojson.NewFeature(orb.Point{3.0, 4.0})
+	feature2.ID = "2"
 
-	// Добавление тестового объекта в хранилище через handleInsert
-	body, err := feature.MarshalJSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, err := http.NewRequest(http.MethodPost, "/insert", bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Hard insert
+	body1, _ := json.Marshal(feature1)
+	body2, _ := json.Marshal(feature2)
+
+	req1 := httptest.NewRequest(http.MethodPost, "/"+testName+"/insert", bytes.NewReader(body1))
+	req2 := httptest.NewRequest(http.MethodPost, "/"+testName+"/insert", bytes.NewReader(body2))
+	rr1 := httptest.NewRecorder()
+	rr2 := httptest.NewRecorder()
+
+	mux.ServeHTTP(rr1, req1)
+	mux.ServeHTTP(rr2, req2)
+
+	// Query with rect parameter
+	rect := "0,0,2,3" // Should include point 1 and not include point 2
+	req := httptest.NewRequest(http.MethodGet, "/select?rect="+rect, nil)
 	rr := httptest.NewRecorder()
+
 	mux.ServeHTTP(rr, req)
 
 	if rr.Code == http.StatusTemporaryRedirect {
-		req, err = http.NewRequest(http.MethodPost, rr.Header().Get("Location"), bytes.NewReader(body))
+		req, err := http.NewRequest(http.MethodGet, rr.Header().Get("Location")+"?rect="+rect, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		rr = httptest.NewRecorder()
 		mux.ServeHTTP(rr, req)
 
-		// Проверка успешного добавления
 		if rr.Code != http.StatusOK {
 			t.Fatalf("Failed to insert feature: got status %v", rr.Code)
-		}
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/select?rect=0,0,2,3", nil)
-	rr = httptest.NewRecorder()
-
-	mux.ServeHTTP(rr, req)
-
-	if rr.Code == http.StatusTemporaryRedirect {
-		req, err = http.NewRequest(http.MethodPost, rr.Header().Get("Location")+"?rect=0,0,2,3", bytes.NewReader(body))
-		if err != nil {
-			t.Fatal(err)
-		}
-		rr = httptest.NewRecorder()
-		mux.ServeHTTP(rr, req)
-
-		if rr.Code != http.StatusOK {
-			t.Errorf("handler returned wrong status code: got %v want %v", rr.Code, http.StatusOK)
 		}
 
 		var result geojson.FeatureCollection
@@ -85,11 +85,20 @@ func TestHandleSelect(t *testing.T) {
 		if len(result.Features) != 1 || result.Features[0].ID != "1" {
 			t.Errorf("Unexpected result: got %+v", result)
 		}
+	} else {
+		t.Fatalf("Unexpected response: got %v", rr.Body.String())
 	}
 }
 
+// Test passed
 func TestHandleInsert(t *testing.T) {
 	r, s, mux := setup()
+
+	t.Cleanup(func() {
+		if err := os.Remove("transaction_" + testName + ".log"); err != nil && !os.IsNotExist(err) {
+			t.Errorf("Failed to delete transaction.log: %v", err)
+		}
+	})
 
 	go func() { s.Run() }()
 	go func() { r.Run() }()
@@ -98,16 +107,20 @@ func TestHandleInsert(t *testing.T) {
 	t.Cleanup(s.Stop)
 
 	feature := geojson.NewFeature(orb.Point{rand.Float64(), rand.Float64()})
+	feature.ID = "1"
 	body, err := feature.MarshalJSON()
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	req, err := http.NewRequest("POST", "/insert", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
+
 	if rr.Code == http.StatusTemporaryRedirect {
 		req, err := http.NewRequest("POST", rr.Header().Get("location"), bytes.NewReader(body))
 		if err != nil {
@@ -125,8 +138,15 @@ func TestHandleInsert(t *testing.T) {
 	}
 }
 
+// Test passed
 func TestHandleReplace(t *testing.T) {
 	r, s, mux := setup()
+
+	t.Cleanup(func() {
+		if err := os.Remove("transaction_" + testName + ".log"); err != nil && !os.IsNotExist(err) {
+			t.Errorf("Failed to delete transaction.log: %v", err)
+		}
+	})
 
 	go func() { s.Run() }()
 	go func() { r.Run() }()
@@ -137,9 +157,11 @@ func TestHandleReplace(t *testing.T) {
 	// Hard insert Data
 	feature := geojson.NewFeature(orb.Point{1.0, 2.0})
 	feature.ID = "1"
+
 	b, _ := feature.MarshalJSON()
-	rq, _ := http.NewRequest("POST", "/"+test_name+"/insert", bytes.NewReader(b))
+	rq, _ := http.NewRequest("POST", "/"+testName+"/insert", bytes.NewReader(b))
 	rr := httptest.NewRecorder()
+
 	mux.ServeHTTP(rr, rq)
 
 	replaceFeature := geojson.NewFeature(orb.Point{1.0, 2.0})
@@ -165,8 +187,15 @@ func TestHandleReplace(t *testing.T) {
 	}
 }
 
+// Test passed
 func TestHandleDelete(t *testing.T) {
 	r, s, mux := setup()
+
+	t.Cleanup(func() {
+		if err := os.Remove("transaction_" + testName + ".log"); err != nil && !os.IsNotExist(err) {
+			t.Errorf("Failed to delete transaction.log: %v", err)
+		}
+	})
 
 	go func() { s.Run() }()
 	go func() { r.Run() }()
@@ -180,13 +209,12 @@ func TestHandleDelete(t *testing.T) {
 	featureCollection.Append(feature)
 
 	write, _ := featureCollection.MarshalJSON()
-	err := os.WriteFile(s.tDataFile, write, 0644)
+	err := os.WriteFile(s.dataFile, write, 0644)
 	if err != nil {
 		t.Fatalf("Failed to write test data: %v", err)
 	}
-	defer os.Remove(s.tDataFile)
+	defer os.Remove(s.dataFile)
 
-	// Delete point
 	deleteFeature := geojson.NewFeature(orb.Point{})
 	deleteFeature.ID = "1"
 	body, _ := json.Marshal(deleteFeature)
@@ -197,8 +225,7 @@ func TestHandleDelete(t *testing.T) {
 	mux.ServeHTTP(rr, req)
 
 	if rr.Code == http.StatusTemporaryRedirect {
-		location := rr.Header().Get("Location")
-		req, _ = http.NewRequest(http.MethodPost, location, bytes.NewReader(body))
+		req, _ = http.NewRequest(http.MethodPost, rr.Header().Get("Location"), bytes.NewReader(body))
 		rr = httptest.NewRecorder()
 		mux.ServeHTTP(rr, req)
 
@@ -206,7 +233,7 @@ func TestHandleDelete(t *testing.T) {
 			t.Errorf("handler returned wrong status code: got %v want %v", rr.Code, http.StatusOK)
 		}
 
-		data, err := os.ReadFile(s.tDataFile)
+		data, err := os.ReadFile(s.dataFile)
 		if err != nil {
 			t.Fatalf("Failed to read storage file: %v", err)
 		}
@@ -226,83 +253,99 @@ func TestHandleDelete(t *testing.T) {
 	}
 }
 
+// Test passed
 func TestHandleCheckpoint(t *testing.T) {
 	r, s, mux := setup()
 
-	// Запуск горутин Storage и Router
+	t.Cleanup(func() {
+		if err := os.Remove("transaction_" + testName + ".log"); err != nil && !os.IsNotExist(err) {
+			t.Errorf("Failed to delete transaction.log: %v", err)
+		}
+	})
+
 	go func() { s.Run() }()
 	go func() { r.Run() }()
 
-	// Остановка горутин после завершения теста
 	t.Cleanup(r.Stop)
 	t.Cleanup(s.Stop)
 
-	// Создание тестового объекта GeoJSON с ID "1"
-	feature := geojson.NewFeature(orb.Point{1.0, 2.0})
-	feature.ID = "1"
+	feature1 := geojson.NewFeature(orb.Point{1.0, 2.0})
+	feature1.ID = "1"
+	feature2 := geojson.NewFeature(orb.Point{3.0, 4.0})
+	feature2.ID = "2"
 
-	// Добавление тестового объекта в хранилище через handleInsert
-	body, err := feature.MarshalJSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, err := http.NewRequest(http.MethodPost, "/insert", bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
+	body1, _ := json.Marshal(feature1)
+	body2, _ := json.Marshal(feature2)
+
+	// Hard insert
+	req1 := httptest.NewRequest(http.MethodPost, "/"+testName+"/insert", bytes.NewReader(body1))
+	req2 := httptest.NewRequest(http.MethodPost, "/"+testName+"/insert", bytes.NewReader(body2))
+	rr1 := httptest.NewRecorder()
+	rr2 := httptest.NewRecorder()
+
+	mux.ServeHTTP(rr1, req1)
+	mux.ServeHTTP(rr2, req2)
+
+	req := httptest.NewRequest(http.MethodPost, "/checkpoint", nil)
 	rr := httptest.NewRecorder()
+
 	mux.ServeHTTP(rr, req)
 
 	if rr.Code == http.StatusTemporaryRedirect {
-		req, err = http.NewRequest(http.MethodPost, rr.Header().Get("Location"), bytes.NewReader(body))
-		if err != nil {
-			t.Fatal(err)
-		}
+		req, _ = http.NewRequest(http.MethodPost, rr.Header().Get("Location"), nil)
 		rr = httptest.NewRecorder()
 		mux.ServeHTTP(rr, req)
 
-		if rr.Code != http.StatusOK {
-			t.Fatalf("Failed to insert feature: got status %v", rr.Code)
-		}
-	}
-
-	// Выполнение запроса для создания чекпоинта
-	req = httptest.NewRequest(http.MethodPost, "/checkpoint", nil)
-	rr = httptest.NewRecorder()
-	mux.ServeHTTP(rr, req)
-
-	if rr.Code == http.StatusTemporaryRedirect {
-		location := rr.Header().Get("Location")
-		req, _ = http.NewRequest(http.MethodPost, location, bytes.NewReader(body))
-		rr = httptest.NewRecorder()
-		mux.ServeHTTP(rr, req)
-
-		// Проверка статуса ответа
 		if rr.Code != http.StatusOK {
 			t.Errorf("handler returned wrong status code: got %v want %v", rr.Code, http.StatusOK)
 		}
 
-		// Проверка, что файл чекпоинта был создан
-		checkpointFile := s.engine.checkpointFile
-		if _, err := os.Stat(checkpointFile); os.IsNotExist(err) {
-			t.Fatalf("Checkpoint file was not created")
-		}
-
-		// Проверка содержимого файла чекпоинта
-		data, err := os.ReadFile(checkpointFile)
+		// Verify checkpoint file
+		checkpointData, err := os.ReadFile(s.engine.chkFile)
 		if err != nil {
 			t.Fatalf("Failed to read checkpoint file: %v", err)
 		}
 
-		var result geojson.FeatureCollection
-		err = json.Unmarshal(data, &result)
-		if err != nil {
-			t.Fatalf("Failed to decode checkpoint file: %v", err)
+		var checkpointFeatures []geojson.Feature
+		lines := strings.Split(string(checkpointData), "\n")
+		for _, line := range lines {
+			if line == "" {
+				continue
+			}
+			var transaction struct {
+				Action  string      `json:"action"`
+				LSN     uint64      `json:"lsn"`
+				Feature interface{} `json:"feature"`
+			}
+			if err := json.Unmarshal([]byte(line), &transaction); err != nil {
+				t.Fatalf("Failed to unmarshal checkpoint transaction: %v", err)
+			}
+
+			featureJSON, err := json.Marshal(transaction.Feature)
+			if err != nil {
+				t.Fatalf("Failed to marshal feature: %v", err)
+			}
+
+			feature, err := geojson.UnmarshalFeature(featureJSON)
+			if err != nil {
+				t.Fatalf("Failed to unmarshal feature: %v", err)
+			}
+
+			checkpointFeatures = append(checkpointFeatures, *feature)
 		}
 
-		// Проверка корректности данных в файле чекпоинта
-		if len(result.Features) != 1 || result.Features[0].ID != "1" {
-			t.Errorf("Unexpected checkpoint data: got %+v", result)
+		if len(checkpointFeatures) != 2 {
+			t.Errorf("Checkpoint file contains incorrect number of features: got %v want %v", len(checkpointFeatures), 2)
+		}
+
+		// Verify transaction log is cleared
+		logData, err := os.ReadFile(s.engine.transLog.Name())
+		if err != nil {
+			t.Fatalf("Failed to read transaction log: %v", err)
+		}
+
+		if len(logData) != 0 {
+			t.Errorf("Transaction log was not cleared after checkpoint")
 		}
 	}
 }
