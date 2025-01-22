@@ -22,7 +22,7 @@ type Engine struct {
 	chkFile    string
 	ctx        context.Context
 	cancel     context.CancelFunc
-	commandCh  chan util.Transaction // каналы для обработки запросов
+	commandCh  chan util.Transaction // channel for commands
 }
 
 func NewEngine(ctx context.Context, transactionLogFile string) *Engine {
@@ -44,7 +44,6 @@ func NewEngine(ctx context.Context, transactionLogFile string) *Engine {
 		return nil
 	}
 
-	// Start the engine goroutine
 	engine.ctx, engine.cancel = context.WithCancel(ctx)
 	go engine.run()
 
@@ -98,12 +97,7 @@ func (e *Engine) handleInsert(feature *geojson.Feature) {
 	e.data[feature.ID.(string)] = feature
 	bounds := feature.Geometry.Bound()
 	e.rtreeIndex.Insert(bounds.Min, bounds.Max, feature)
-
-	//go func() {
-	//	e.mu.Lock()
-	//	defer e.mu.Unlock()
 	e.writeTransactionLog("insert", feature)
-	//}()
 }
 
 func (e *Engine) handleReplace(feature *geojson.Feature) {
@@ -117,7 +111,8 @@ func (e *Engine) handleReplace(feature *geojson.Feature) {
 func (e *Engine) handleDelete(feature *geojson.Feature) {
 	e.lsn++
 	delete(e.data, feature.ID.(string))
-	e.rtreeIndex.Delete(feature.Geometry.Bound().Min, feature.Geometry.Bound().Max, feature)
+	bounds := feature.Geometry.Bound()
+	e.rtreeIndex.Delete(bounds.Min, bounds.Max, feature)
 	e.writeTransactionLog("delete", feature)
 }
 
@@ -129,7 +124,6 @@ func (e *Engine) handleCheckpoint() {
 	}
 	defer os.Remove(tmpFile.Name())
 
-	//transactions := []interface{}{}
 	for _, feature := range e.data {
 		transaction := struct {
 			Action  string      `json:"action"`
@@ -184,7 +178,6 @@ func (e *Engine) clearTransactionLog() error {
 }
 
 func (e *Engine) handleSelect(rect [2][2]float64) []*geojson.Feature {
-	//slog.Info("Engine select", "id", rect[0], "id", rect[1])
 	var results []*geojson.Feature
 	e.rtreeIndex.Search(rect[0], rect[1], func(min, max [2]float64, feature *geojson.Feature) bool {
 		results = append(results, feature)
@@ -219,7 +212,6 @@ func (e *Engine) writeTransactionLog(action string, feature *geojson.Feature) {
 
 func (e *Engine) loadCheckpoint() error {
 	file, err := os.OpenFile(e.chkFile, os.O_RDWR|os.O_CREATE, 0644)
-	//file, err := os.Open(e.chkFile)
 	if err != nil {
 		return err
 	}
@@ -258,16 +250,6 @@ func (e *Engine) loadCheckpoint() error {
 	if err := scanner.Err(); err != nil {
 		return err
 	}
-
-	//decoder := json.NewDecoder(file)
-	//for decoder.More() {
-	//	var feature geojson.Feature
-	//	if err := decoder.Decode(&feature); err != nil {
-	//		return err
-	//	}
-	//	e.data[feature.ID.(string)] = &feature
-	//	e.rtreeIndex.Insert(feature.Geometry.Bound().Min, feature.Geometry.Bound().Max, &feature)
-	//}
 
 	return nil
 }

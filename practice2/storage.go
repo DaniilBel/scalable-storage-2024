@@ -65,7 +65,6 @@ func (s *Storage) handleSelect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Query engine
 	responseChan := make(chan any)
 	s.engine.commandCh <- util.Transaction{Action: "select", Rect: *rect, Response: responseChan}
 	features := <-responseChan
@@ -92,8 +91,8 @@ func (s *Storage) handleCheckpoint(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Storage) handleInsert(w http.ResponseWriter, r *http.Request) {
-	//s.mu.Lock()
-	//defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -109,7 +108,6 @@ func (s *Storage) handleInsert(w http.ResponseWriter, r *http.Request) {
 
 	//slog.Info("Sending insert transaction", "id", feature.ID)
 	responseChan := make(chan any)
-	//s.engine.commandCh <- util.Transaction{Action: "insert", Feature: feature, Response: responseChan}
 
 	select {
 	case s.engine.commandCh <- util.Transaction{Action: "insert", Feature: feature, Response: responseChan}:
