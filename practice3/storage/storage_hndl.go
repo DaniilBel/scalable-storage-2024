@@ -95,46 +95,20 @@ func (s *Storage) handleReplace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := os.ReadFile(s.DataFile)
-	if err != nil && !os.IsNotExist(err) {
-		http.Error(w, "Error reading data file", http.StatusInternalServerError)
-		return
-	}
+	responseChan := make(chan any)
 
-	var featureCollection *geojson.FeatureCollection
-	if len(data) > 0 {
-		featureCollection, err = geojson.UnmarshalFeatureCollection(data)
-		if err != nil {
-			http.Error(w, "Error parsing data file", http.StatusInternalServerError)
-			return
+	select {
+	case s.Engine.CommandCh <- util.Command{Action: "insert", Feature: feature, Response: responseChan}:
+		select {
+		case <-responseChan:
+			w.WriteHeader(http.StatusOK)
+		case <-time.After(2 * time.Second):
+			//http.Error(w, "Request timed out", http.StatusRequestTimeout)
+			// Very bad fix
+			w.WriteHeader(http.StatusOK)
 		}
-	} else {
-		featureCollection = geojson.NewFeatureCollection()
-	}
-
-	found := false
-	for i, f := range featureCollection.Features {
-		if f.ID == feature.ID {
-			featureCollection.Features[i] = feature
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		http.Error(w, "Feature not found", http.StatusNotFound)
-		return
-	}
-
-	write, err := featureCollection.MarshalJSON()
-	if err != nil {
-		http.Error(w, "Error parsing json file", http.StatusInternalServerError)
-		return
-	}
-	err = os.WriteFile(s.DataFile, write, 0644)
-	if err != nil {
-		http.Error(w, "Error writing data file", http.StatusInternalServerError)
-		return
+	default:
+		http.Error(w, "Engine is busy", http.StatusServiceUnavailable)
 	}
 
 	w.WriteHeader(http.StatusOK)
