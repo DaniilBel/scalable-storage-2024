@@ -69,6 +69,8 @@ func TestHandleReplication(t *testing.T) {
 		t.Fatalf("Failed to send transaction: %v", err)
 	}
 
+	time.Sleep(100 * time.Millisecond)
+
 	responseChan := make(chan any)
 	s.Engine.CommandCh <- util.Command{Action: "select", Rect: [2][2]float64{{0, 0}, {3, 3}}, Response: responseChan}
 	features := <-responseChan
